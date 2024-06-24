@@ -15,24 +15,31 @@ type DelayFunc func(tries int) time.Duration
 
 // A Mutex is a distributed mutual exclusion lock.
 type Mutex struct {
+	// 锁名称 锁关键字 所有对于锁的操作(获取、释放)都是对于这个锁进行的
 	name   string
-	expiry time.Duration
-
-	tries     int
+	// 锁过期时间 表示锁自动失效的时间长度 有助于防止死锁
+	expiry time.Duration 
+	// 获取锁的最大次数 当第一次尝试失败后 mutex 可以重试一定次数 
+	tries     int 
+	// 每次获取锁之间的延迟策略 
 	delayFunc DelayFunc
-
+	// 用于补偿网络延迟的时间
 	driftFactor   float64
+	// 用于锁续期时增加额外的时间 以防止锁意外过期
 	timeoutFactor float64
-
-	quorum int
-
+	// 成功执行操作所需要的最小redis节点响应数量。默认为半数
+	quorum int 
+	// 生成锁值的函数。锁值是随机生层的，以保证锁的唯一性和安全性
 	genValueFunc  func() (string, error)
 	value         string
+	// 锁预计过期时间。有助于在锁续期和判断锁状态时判断锁是否仍然有效
 	until         time.Time
+	// 是否在每次尝试获取锁之前打乱redis的节点的顺序。这样可以提高多个客户端同时尝试获取锁的公平性
 	shuffle       bool
 	failFast      bool
+	// 在锁续期时是否采用Nx(not esixt)标志，如果为true，表示锁存在且违背其他客户端获取时才会续期
 	setNXOnExtend bool
-
+	// 一个redis连接池切片，包含所有用于redis操作的节点。这使得mutex可以额在多个redis节点上操作，提高系统的可用性和性能.
 	pools []redis.Pool
 }
 
@@ -84,6 +91,7 @@ func (m *Mutex) lockContext(ctx context.Context, tries int) error {
 
 	var timer *time.Timer
 	for i := 0; i < tries; i++ {
+		// 为0直接获取锁 不为0添加延迟等待
 		if i != 0 {
 			if timer == nil {
 				timer = time.NewTimer(m.delayFunc(i))
@@ -102,7 +110,7 @@ func (m *Mutex) lockContext(ctx context.Context, tries int) error {
 		}
 
 		start := time.Now()
-
+		// 计算获取到锁的节点
 		n, err := func() (int, error) {
 			ctx, cancel := context.WithTimeout(ctx, time.Duration(int64(float64(m.expiry)*m.timeoutFactor)))
 			defer cancel()
@@ -112,12 +120,15 @@ func (m *Mutex) lockContext(ctx context.Context, tries int) error {
 		}()
 
 		now := time.Now()
+		// 计算预计的剩余过期时间
 		until := now.Add(m.expiry - now.Sub(start) - time.Duration(int64(float64(m.expiry)*m.driftFactor)))
+		// 超过半数获得所 and 锁已经释放 获取成功直接返回
 		if n >= m.quorum && now.Before(until) {
 			m.value = value
 			m.until = until
 			return nil
 		}
+		// 获取失败释放锁 进入下一次重试
 		_, _ = func() (int, error) {
 			ctx, cancel := context.WithTimeout(ctx, time.Duration(int64(float64(m.expiry)*m.timeoutFactor)))
 			defer cancel()
@@ -224,6 +235,7 @@ func (m *Mutex) acquire(ctx context.Context, pool redis.Pool, value string) (boo
 		return false, err
 	}
 	defer conn.Close()
+	// 对redis设置锁
 	reply, err := conn.SetNX(m.name, value, m.expiry)
 	if err != nil {
 		return false, err
@@ -231,6 +243,8 @@ func (m *Mutex) acquire(ctx context.Context, pool redis.Pool, value string) (boo
 	return reply, nil
 }
 
+// 保证原子性 
+// 获取和删除一起操作
 var deleteScript = redis.NewScript(1, `
 	local val = redis.call("GET", KEYS[1])
 	if val == ARGV[1] then
@@ -252,9 +266,11 @@ func (m *Mutex) release(ctx context.Context, pool redis.Pool, value string) (boo
 	if err != nil {
 		return false, err
 	}
+	// 等于-1 返回false
 	if status == int64(-1) {
 		return false, ErrLockAlreadyExpired
 	}
+	// 不等于0 返回true
 	return status != int64(0), nil
 }
 
@@ -303,6 +319,8 @@ func (m *Mutex) actOnPoolsAsync(actFn func(redis.Pool) (bool, error)) (int, erro
 	}
 
 	ch := make(chan result, len(m.pools))
+	// 在redis 池依次获取redis.Client执行相应操作
+	// 记录执行的状态 
 	for node, pool := range m.pools {
 		go func(node int, pool redis.Pool) {
 			r := result{node: node}
@@ -342,9 +360,11 @@ func (m *Mutex) actOnPoolsAsync(actFn func(redis.Pool) (bool, error)) (int, erro
 			}
 		}
 	}
-
+	// 执行失败的超过半数 返回失败
 	if len(taken) >= m.quorum {
 		return n, &ErrTaken{Nodes: taken}
 	}
+	// 返回执行成功的次数
 	return n, err
 }
+
