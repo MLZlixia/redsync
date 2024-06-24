@@ -7,6 +7,11 @@ import (
 	"github.com/go-redsync/redsync/v4/redis"
 )
 
+/ go-redsync/redsync使用了一种叫做“红锁”（Redlock）的算法来实现分布式锁。红锁算法的基本思想是：在多个Redis实例之间协调，确保只有一个客户端能够获得锁。
+// 在go-redsync/redsync中，我们可以通过创建一个Pool对象来连接多个Redis实例。Pool对象中包含了多个redis.Client对象，每个redis.Client对象表示一个Redis实例。
+// 当我们需要获取一个分布式锁时，我们可以创建一个Mutex对象，并调用Lock方法来获取锁。在Lock方法中，go-redsync/redsync会依次尝试在多个Redis实例上执行SET key value NX PX expire命令，以获取锁。如果在大多数Redis实例上都成功获取了锁，那么go-redsync/redsync会返回一个Mutex对象，表示获取锁成功。
+// 当我们需要释放一个分布式锁时，我们可以调用Unlock方法来释放锁。在Unlock方法中，go-redsync/redsync会依次尝试在多个Redis实例上执行DEL key命令，以释放锁。
+
 const (
 	minRetryDelayMilliSec = 50
 	maxRetryDelayMilliSec = 250
