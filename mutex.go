@@ -37,7 +37,7 @@ type Mutex struct {
 	// 是否在每次尝试获取锁之前打乱redis的节点的顺序。这样可以提高多个客户端同时尝试获取锁的公平性
 	shuffle       bool
 	failFast      bool
-	// 在锁续期时是否采用Nx(not esixt)标志，如果为true，表示锁存在且违背其他客户端获取时才会续期
+	// 在锁续期时是否采用Nx(not esixt)标志，如果为true，表示锁存在且未被其他客户端获取时才会续期
 	setNXOnExtend bool
 	// 一个redis连接池切片，包含所有用于redis操作的节点。这使得mutex可以额在多个redis节点上操作，提高系统的可用性和性能.
 	pools []redis.Pool
@@ -91,7 +91,7 @@ func (m *Mutex) lockContext(ctx context.Context, tries int) error {
 
 	var timer *time.Timer
 	for i := 0; i < tries; i++ {
-		// 为0直接获取锁 不为0添加延迟等待
+		// 为0直接获取锁 不为0添加延迟等待 获取错误可重试
 		if i != 0 {
 			if timer == nil {
 				timer = time.NewTimer(m.delayFunc(i))
@@ -151,9 +151,11 @@ func (m *Mutex) Unlock() (bool, error) {
 
 // UnlockContext unlocks m and returns the status of unlock.
 func (m *Mutex) UnlockContext(ctx context.Context) (bool, error) {
+	// 释放锁
 	n, err := m.actOnPoolsAsync(func(pool redis.Pool) (bool, error) {
 		return m.release(ctx, pool, m.value)
 	})
+	// 小于规定的节点数目
 	if n < m.quorum {
 		return false, err
 	}
@@ -166,20 +168,27 @@ func (m *Mutex) Extend() (bool, error) {
 }
 
 // ExtendContext resets the mutex's expiry and returns the status of expiry extension.
+// 重置锁的过期时间
+// 使用锁保证特定时间内的独占访问，为了避免独占情况，会设置一个有效期。但是当一个进程阻塞，需要延长超时时间。
+// ExtendContext 就是会更新锁的过期时间，并且会返回是否何止成功。
 func (m *Mutex) ExtendContext(ctx context.Context) (bool, error) {
 	start := time.Now()
 	n, err := m.actOnPoolsAsync(func(pool redis.Pool) (bool, error) {
+		// 延长超时时间 延长的时间为 
 		return m.touch(ctx, pool, m.value, int(m.expiry/time.Millisecond))
 	})
+	// 设置的节点小于 允许的节点数目
 	if n < m.quorum {
 		return false, err
 	}
 	now := time.Now()
 	until := now.Add(m.expiry - now.Sub(start) - time.Duration(int64(float64(m.expiry)*m.driftFactor)))
+	// 计算是否达到等待过期时间 没有达到返回成功
 	if now.Before(until) {
 		m.until = until
 		return true, nil
 	}
+	// 达到返回失败
 	return false, ErrExtendFailed
 }
 
@@ -274,8 +283,12 @@ func (m *Mutex) release(ctx context.Context, pool redis.Pool, value string) (boo
 	return status != int64(0), nil
 }
 
+// 用于实现锁的续期操作
+// 判断KEYS[1]的值和传入的value是否具有一致(检测此客户端是否是合法的持有者)
+   // 如果是合法持有者尝试续期
+// 不是合法持有者 尝试使用setNx 对keys[1]设置过期时间为argv[2],锁的值为argv[1]
 var touchWithSetNXScript = redis.NewScript(1, `
-	if redis.call("GET", KEYS[1]) == ARGV[1] then
+	if redis.call("GET", KEYS[1]) == ARGV[1] then 
 		return redis.call("PEXPIRE", KEYS[1], ARGV[2])
 	elseif redis.call("SET", KEYS[1], ARGV[1], "PX", ARGV[2], "NX") then
 		return 1
@@ -367,4 +380,3 @@ func (m *Mutex) actOnPoolsAsync(actFn func(redis.Pool) (bool, error)) (int, erro
 	// 返回执行成功的次数
 	return n, err
 }
-
